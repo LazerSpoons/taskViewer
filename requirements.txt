@@ -1,0 +1,4 @@
+boto3>=1.34.0
+psutil>=7.0.0
+sv_ttk>=2.5.5
+pywinstyles>=1.8
