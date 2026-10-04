@@ -24,4 +24,4 @@ python aws_setup.py<br>
 python tkinterPracticeTwo.py<br>
 
 Architecture:<br>
-A background daemon thread collects system stats every 60 seconds and pushes them to CloudWatch and DynamoDB. The UI polls an in-memory buffer every 3 seconds, soit never touches AWS directly, keeping the interface responsive at all times. To be honest I figured the architecture out kinda after pushing metrics to CW and DDB, so if I ever have money I'll add more functionality with them, because as of now only DDB actually does anything (I don't count my link to CW metrics as a real feature).
+A background daemon thread collects system stats every 5 seconds for the live readings, and pushes one reading every 60 seconds to CloudWatch and DynamoDB (both intervals are at the top of monitor.py). The UI polls an in-memory buffer every second, so it never touches AWS directly, keeping the interface responsive at all times. To be honest I figured the architecture out kinda after pushing metrics to CW and DDB, so if I ever have money I'll add more functionality with them, because as of now only DDB actually does anything (I don't count my link to CW metrics as a real feature).

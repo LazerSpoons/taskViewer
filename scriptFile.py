@@ -2,15 +2,34 @@ import psutil
 import re
 
 
+def _iter_processes(attrs):
+    """Yield (proc, info) for every running process, like psutil.process_iter.
+
+    psutil.process_iter keeps a module-level cache of Process objects and
+    overwrites proc.info on them each time it runs. The monitor's background
+    thread uses process_iter (it needs that cache for per-process CPU %), so if
+    these UI-thread functions used it too, the two threads could overwrite each
+    other's proc.info mid-scan. Fresh Process objects here belong only to the
+    caller, so there's no shared state and nothing to lock.
+    """
+    for pid in psutil.pids():
+        try:
+            proc = psutil.Process(pid)
+            info = proc.as_dict(attrs=attrs)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue  # Process exited or is protected — skip it
+        yield proc, info
+
+
 def killProccessByName(name: str) -> bool:
     if not name:
         return False
 
     target = (name + ".exe").casefold()
     found = False
-    for proc in psutil.process_iter(['name']):
+    for proc, info in _iter_processes(['name']):
         try:
-            pname = (proc.info.get('name') or "").casefold()
+            pname = (info.get('name') or "").casefold()
             if pname == target:
                 proc.kill()
                 found = True
@@ -55,9 +74,8 @@ def search(query: str):
     seen_pids = set()
 
     # -------- 1) Processes --------
-    for proc in psutil.process_iter(['pid', 'name', 'exe', 'cmdline']):
+    for _, info in _iter_processes(['pid', 'name', 'exe', 'cmdline']):
         try:
-            info = proc.info
             pid  = info['pid']
             name = info.get('name') or ""
             ncf  = name.casefold()

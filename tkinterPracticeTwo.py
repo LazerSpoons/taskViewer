@@ -2,7 +2,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import scriptFile as sf
 import sv_ttk as svtk
-import pywinstyles, sys, webbrowser, threading
+import pywinstyles, sys, webbrowser, threading, queue
 from monitor import SystemMonitor
 
 # Opens the CloudWatch Metrics browser filtered to our namespace — always free
@@ -13,8 +13,30 @@ _CW_URL = (
 
 _monitor = None  # set after the tkinter root window is created
 
+# One window per action — maps a key like "stats" to its open Toplevel
+_open_windows = {}
+
 
 # --- Helpers ---
+def open_single_window(key):
+    """Return a new Toplevel for `key`, or None if one is already open.
+
+    If the window already exists it's restored and brought to the front instead,
+    so pressing the same main-window button twice never opens a duplicate.
+    """
+    existing = _open_windows.get(key)
+    # winfo_exists() is 0 once the user closes the window, so a stale entry is ignored
+    if existing is not None and existing.winfo_exists():
+        existing.deiconify()  # un-minimize if needed
+        existing.lift()
+        existing.focus_force()
+        return None
+
+    win = tk.Toplevel(root)
+    _open_windows[key] = win
+    return win
+
+
 def apply_theme_to_titlebar(win):
     version = sys.getwindowsversion()
     if version.major == 10 and version.build >= 22000:
@@ -24,7 +46,9 @@ def apply_theme_to_titlebar(win):
 
 # --- Actions ---
 def killTask():
-    win = tk.Toplevel(root)
+    win = open_single_window("kill")
+    if win is None:
+        return
     win.title("Kill Task")
 
     ttk.Label(win, text="Enter exact process name (without .exe):").grid(row=0, column=0, padx=10, pady=(10, 4), sticky="w")
@@ -49,7 +73,9 @@ def killTask():
     apply_theme_to_titlebar(win)
 
 def searchAndDestroy():
-    win = tk.Toplevel(root)
+    win = open_single_window("search")
+    if win is None:
+        return
     win.title("Search & Destroy")
     win.geometry("420x420")
 
@@ -158,7 +184,9 @@ def searchAndDestroy():
     apply_theme_to_titlebar(win)
 
 def showSystemStats():
-    win = tk.Toplevel(root)
+    win = open_single_window("stats")
+    if win is None:
+        return
     win.title("System Stats")
     win.geometry("580x640")
     win.resizable(True, True)
@@ -228,14 +256,18 @@ def showSystemStats():
     error_var = tk.StringVar(value="")
     ttk.Label(aws_frame, textvariable=push_var).grid(row=0, column=0, padx=8, sticky="w")
     ttk.Label(aws_frame, textvariable=error_var, foreground="red").grid(row=1, column=0, padx=8, sticky="w")
+
+    # Worker threads must never touch tkinter (it isn't thread-safe), so the clear
+    # worker drops its result message here and _refresh shows it on the UI thread
+    clear_results = queue.Queue()
+
     def _do_clear():
         if not messagebox.askyesno("Clear Past Sessions",
                                    "Delete all past-session records from DynamoDB and history?"):
             return
         # Run in a daemon thread — DynamoDB batch deletes can take a moment
         def _run():
-            msg = _monitor.clear_past_sessions()
-            win.after(0, lambda: messagebox.showinfo("Done", msg))
+            clear_results.put(_monitor.clear_past_sessions())
         threading.Thread(target=_run, daemon=True).start()
 
     btn_frame = ttk.Frame(aws_frame)
@@ -246,7 +278,12 @@ def showSystemStats():
     win.columnconfigure(0, weight=1)
     win.rowconfigure(2, weight=1)  # history table stretches when window is resized
 
+    # (row count, newest timestamp) of the history last drawn — lets _refresh skip
+    # rebuilding the table when nothing new was pushed, so scrolling isn't reset
+    shown_history = None
+
     def _refresh():
+        nonlocal shown_history
         # Guard against the window being closed while a pending after() is queued
         if not win.winfo_exists():
             return
@@ -268,27 +305,43 @@ def showSystemStats():
 
             # Rebuild history table from in-memory data — no AWS call made here
             history = _monitor.get_history()
-            tv.delete(*tv.get_children())
-            for r in reversed(history):  # newest first
-                sent_mb = r['net_bytes_sent'] / 1024 / 1024
-                recv_mb = r['net_bytes_recv'] / 1024 / 1024
-                # Apply "past" tag to dim records from previous sessions
-                tag = ("past",) if r.get("past_session") else ()
-                tv.insert("", "end", values=(
-                    r["timestamp"][:19].replace("T", " "),
-                    f"{r['cpu_pct']:.1f}",
-                    f"{r['mem_pct']:.1f}",
-                    f"{r['disk_pct']:.1f}",
-                    f"{sent_mb:.1f}",
-                    f"{recv_mb:.1f}",
-                ), tags=tag)
+            key = (len(history), history[-1]["timestamp"] if history else None)
+            if key != shown_history:
+                shown_history = key
+                _draw_history(history)
 
             status = _monitor.get_aws_status()
             if status["last_push_time"]:
                 push_var.set(f"Last push: {status['last_push_time']}")
             error_var.set(f"Error: {status['last_error']}" if status["last_error"] else "")
 
-        win.after(3000, _refresh)  # poll every 3 seconds
+        win.after(1000, _refresh)  # poll every second — cheap, it only reads memory
+
+        # Show any finished "Clear Past Sessions" result. Done after scheduling the
+        # next refresh, because showinfo blocks until dismissed and the live
+        # readings should keep updating behind it
+        try:
+            msg = clear_results.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            messagebox.showinfo("Done", msg)
+
+    def _draw_history(history):
+        tv.delete(*tv.get_children())
+        for r in reversed(history):  # newest first
+            sent_mb = r['net_bytes_sent'] / 1024 / 1024
+            recv_mb = r['net_bytes_recv'] / 1024 / 1024
+            # Apply "past" tag to dim records from previous sessions
+            tag = ("past",) if r.get("past_session") else ()
+            tv.insert("", "end", values=(
+                r["timestamp"][:19].replace("T", " "),
+                f"{r['cpu_pct']:.1f}",
+                f"{r['mem_pct']:.1f}",
+                f"{r['disk_pct']:.1f}",
+                f"{sent_mb:.1f}",
+                f"{recv_mb:.1f}",
+            ), tags=tag)
 
     win.after(100, _refresh)  # first call after window renders
 
@@ -312,5 +365,16 @@ apply_theme_to_titlebar(root)
 
 _monitor = SystemMonitor()
 _monitor.start()
+
+
+def on_close():
+    """Stop the monitor thread cleanly before exiting, so an in-flight AWS push can finish."""
+    root.withdraw()            # hide immediately so closing feels instant
+    _monitor.stop()            # wakes the thread from its wait() right away
+    _monitor.join(timeout=2)   # give a scan or push in progress a moment to finish
+    root.destroy()             # ends mainloop; the daemon flag covers anything still running
+
+
+root.protocol("WM_DELETE_WINDOW", on_close)
 
 root.mainloop()

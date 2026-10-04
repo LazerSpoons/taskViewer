@@ -2,17 +2,29 @@ import collections
 import logging
 import socket
 import threading
+import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from logging.handlers import RotatingFileHandler
 
 import psutil
 
-# How often (in seconds) the background thread collects stats and pushes to AWS
-_INTERVAL = 60
+# How often (in seconds) the background thread reads system stats for the live UI
+_COLLECT_INTERVAL = 5
+
+# How often (in seconds) a reading is pushed to AWS and added to the history table.
+# Kept separate from collection so the live readings can update quickly
+# without adding AWS calls (and cost)
+_PUSH_INTERVAL = 60
+
+# Push on every Nth collection — e.g. 60 / 5 = every 12th reading
+_PUSH_EVERY = max(1, round(_PUSH_INTERVAL / _COLLECT_INTERVAL))
 
 # Maximum number of readings kept in memory for the UI to display
 _HISTORY  = 100
+
+# DynamoDB table created by aws_setup.py
+_TABLE_NAME = "SystemStats"
 
 # Module-level logger — errors from AWS calls go here, never to the UI
 _log = logging.getLogger("taskviewer.monitor")
@@ -41,9 +53,13 @@ class SystemMonitor:
         # and causes _run() to exit cleanly instead of waiting for the full 60s interval
         self._stop    = threading.Event()
 
-        # Rolling buffer of the last 100 readings; oldest entry is dropped automatically
+        # Rolling buffer of the last 100 *pushed* readings (one per _PUSH_INTERVAL),
+        # matching what's in DynamoDB; oldest entry is dropped automatically
         # when maxlen is reached, so we never need to manually trim it
         self._history = collections.deque(maxlen=_HISTORY)
+
+        # Most recent reading (one per _COLLECT_INTERVAL) — drives the live readings
+        self._latest = None
 
         # Shared state read by get_aws_status() — protected by _lock
         self._last_push_time = None  # ISO string of the last successful AWS push
@@ -74,12 +90,16 @@ class SystemMonitor:
         """Signal the background thread to exit on its next wake-up."""
         self._stop.set()
 
+    def join(self, timeout=None):
+        """Wait up to `timeout` seconds for the background thread to finish."""
+        self._thread.join(timeout)
+
     def get_latest(self):
         """Return the most recent reading as a dict, or None if no data yet."""
         with self._lock:
-            # _history[-1] is the newest item; dict() makes a shallow copy so
-            # the caller can't accidentally mutate the stored record
-            return dict(self._history[-1]) if self._history else None
+            # dict() makes a shallow copy so the caller can't accidentally
+            # mutate the stored record
+            return dict(self._latest) if self._latest else None
 
     def get_history(self):
         """Return a list of all stored readings (oldest first), each as a dict."""
@@ -109,9 +129,14 @@ class SystemMonitor:
 
         if self._ddb_table is not None:
             try:
+                # boto3 resources aren't thread-safe, and _ddb_table is in use by the
+                # monitor thread — so this worker thread makes its own
+                import boto3
+                table = boto3.resource("dynamodb", region_name=self._region).Table(_TABLE_NAME)
+
                 # batch_writer handles the 25-items-per-request DynamoDB limit
                 # automatically and retries any unprocessed items
-                with self._ddb_table.batch_writer() as batch:
+                with table.batch_writer() as batch:
                     for r in past:
                         batch.delete_item(
                             Key={"hostname": r["hostname"], "timestamp": r["timestamp"]}
@@ -130,22 +155,39 @@ class SystemMonitor:
 
     def _run(self):
         """Entry point for the background thread. Runs until stop() is called."""
+        # Prime cpu_percent — its first non-blocking call always returns 0.0.
+        # The process scan in _collect() runs before the CPU read, so even the first
+        # reading covers a window of a couple of seconds.
+        psutil.cpu_percent(interval=None)
         self._init_aws_clients()
 
+        tick = 0  # counts collections; tick 0 pushes so AWS gets data right away
         while not self._stop.is_set():
-            record = self._collect()
+            started = time.monotonic()
+            # Catch-all so one bad cycle is logged and skipped — an uncaught
+            # exception here would kill the thread and silently freeze the stats
+            try:
+                record = self._collect()
 
-            # Append to history under the lock so the UI thread sees a consistent state
-            with self._lock:
-                self._history.append(record)
+                # Update under the lock so the UI thread sees a consistent state
+                with self._lock:
+                    self._latest = record
 
-            self._push_cloudwatch(record)
-            self._push_dynamodb(record)
+                if tick % _PUSH_EVERY == 0:
+                    with self._lock:
+                        self._history.append(record)
+                    self._push_cloudwatch(record)
+                    self._push_dynamodb(record)
+            except Exception:
+                _log.exception("Monitor cycle failed")
+            tick += 1
 
-            # wait() sleeps for 60s BUT wakes immediately if stop() is called.
-            # This is why we use Event.wait() instead of time.sleep() —
-            # time.sleep(60) would make the app hang for up to 60s on close.
-            self._stop.wait(timeout=_INTERVAL)
+            # Subtract the time spent collecting/pushing so readings stay
+            # _COLLECT_INTERVAL apart instead of drifting later each cycle.
+            # wait() sleeps BUT wakes immediately if stop() is called —
+            # time.sleep() would make the app hang until the timer ran out on close.
+            elapsed = time.monotonic() - started
+            self._stop.wait(timeout=max(0, _COLLECT_INTERVAL - elapsed))
 
     def _init_aws_clients(self):
         """Create boto3 clients. Called once when the thread starts."""
@@ -154,7 +196,7 @@ class SystemMonitor:
             self._cw_client = boto3.client("cloudwatch", region_name=self._region)
             dynamodb        = boto3.resource("dynamodb", region_name=self._region)
             # Table() doesn't make a network call — it's just a reference to the table
-            self._ddb_table = dynamodb.Table("SystemStats")
+            self._ddb_table = dynamodb.Table(_TABLE_NAME)
         except Exception as exc:
             # If boto3 isn't installed or credentials are missing, log it and continue.
             # _cw_client and _ddb_table stay None, and the push methods will no-op.
@@ -208,7 +250,9 @@ class SystemMonitor:
         return {
             "hostname":       self._hostname,
             "timestamp":      datetime.now(timezone.utc).isoformat(),
-            "cpu_pct":        round(psutil.cpu_percent(interval=1), 2),
+            # interval=None = average CPU since the previous call (i.e. over the last
+            # collection window) and returns instantly, instead of blocking for 1s
+            "cpu_pct":        round(psutil.cpu_percent(interval=None), 2),
             "mem_pct":        round(psutil.virtual_memory().percent, 2),
             "disk_pct":       round(psutil.disk_usage("C:\\").percent, 2),
             "net_bytes_sent": psutil.net_io_counters().bytes_sent,
@@ -222,7 +266,12 @@ class SystemMonitor:
     # Windows pseudo-processes that hold system memory but aren't real user apps.
     # Task Manager excludes these from its normal process list; we do the same
     # so they don't crowd out real applications like Firefox or Chrome.
-    _SYSTEM_PROCS = {"MemCompression", "System", "Idle", "Registry"}
+    # ("System Idle Process" is how psutil names the idle process on Windows.)
+    _SYSTEM_PROCS = {"MemCompression", "System", "System Idle Process", "Registry"}
+
+    # Per-process cpu_percent is per-core (can reach 100% x cores); dividing by
+    # the core count gives a share of the whole machine, like Task Manager shows
+    _CPU_COUNT = psutil.cpu_count() or 1
 
     def _top_processes(self):
         """Find the process using the most CPU, RAM, and disk I/O.
@@ -234,7 +283,7 @@ class SystemMonitor:
         - cpu_percent(interval=None) returns CPU usage since the LAST call for
           that process. The very first call always returns 0.0, so the first
           collection cycle will show 0% for all processes. After that it works
-          correctly, measuring usage over each 60-second window.
+          correctly, measuring usage over each _COLLECT_INTERVAL window.
         - io_counters() counts cumulative bytes read+written since boot, not a
           rate. So 'top disk' means the process that has done the most total
           disk work since the machine started, not necessarily right now.
@@ -243,19 +292,28 @@ class SystemMonitor:
         top_ram_name,  top_ram_val  = "--", -1.0
         top_disk_name, top_disk_val = "--", -1
 
-        # process_iter is efficient — it fetches these fields in one shot per process
-        # rather than making a separate syscall for each attribute
-        for proc in psutil.process_iter(["name", "cpu_percent", "memory_percent"]):
+        # process_iter fetches all these fields in one shot per process. io_counters
+        # must be in this list rather than called separately: on Windows, protected
+        # processes make psutil fall back to a slow system-wide query, and a separate
+        # call repeats it — that roughly doubled the scan time (~4.7s vs ~2.3s).
+        # Fields that are access-denied come back as None instead of raising.
+        #
+        # This thread must be the only caller of process_iter: it caches Process
+        # objects at module level (that cache is what makes per-process cpu_percent
+        # work between scans), and overwrites proc.info on them. The UI's search
+        # in scriptFile.py deliberately avoids it for that reason.
+        for proc in psutil.process_iter(["name", "cpu_percent", "memory_percent", "io_counters"]):
             try:
-                name = proc.info["name"] or "unknown"
+                info = proc.info  # read once, then only use this local reference
+                name = info["name"] or "unknown"
 
                 # Skip Windows pseudo-processes — they hold system memory that
                 # Task Manager also excludes from the normal process list
                 if name in self._SYSTEM_PROCS:
                     continue
 
-                cpu  = proc.info["cpu_percent"] or 0.0
-                ram  = proc.info["memory_percent"] or 0.0
+                cpu  = (info["cpu_percent"] or 0.0) / self._CPU_COUNT
+                ram  = info["memory_percent"] or 0.0
 
                 if cpu > top_cpu_val:
                     top_cpu_val  = cpu
@@ -265,15 +323,12 @@ class SystemMonitor:
                     top_ram_val  = ram
                     top_ram_name = f"{name} ({ram:.1f}%)"
 
-                try:
-                    io = proc.io_counters()
+                io = info["io_counters"]
+                if io is not None:  # None = this process denies access to its I/O stats
                     total_io = io.read_bytes + io.write_bytes
                     if total_io > top_disk_val:
                         top_disk_val  = total_io
                         top_disk_name = f"{name} ({total_io / 1024 / 1024:.0f} MB)"
-                except (psutil.AccessDenied, AttributeError):
-                    # Some system processes deny access to io_counters — skip them
-                    pass
 
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 # Process exited or is protected — skip and move on
