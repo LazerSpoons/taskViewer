@@ -192,6 +192,15 @@ def showSystemStats():
     win.resizable(True, True)
     apply_theme_to_titlebar(win)
 
+    # The top-process scan is the costly part of monitoring, so the monitor only
+    # runs it often while this window is open to show the results
+    _monitor.set_live_view(True)
+
+    def _on_stats_close():
+        _monitor.set_live_view(False)
+        win.destroy()
+    win.protocol("WM_DELETE_WINDOW", _on_stats_close)
+
     # -- Live Readings --
     live_frame = ttk.LabelFrame(win, text="Live Readings", padding=8)
     live_frame.grid(row=0, column=0, padx=10, pady=(10, 4), sticky="ew")

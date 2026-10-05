@@ -20,6 +20,13 @@ _PUSH_INTERVAL = 60
 # Push on every Nth collection — e.g. 60 / 5 = every 12th reading
 _PUSH_EVERY = max(1, round(_PUSH_INTERVAL / _COLLECT_INTERVAL))
 
+# How often (in seconds) the top-process scan runs while the System Stats window
+# is open. The scan is by far the most expensive part of a collection (~2.3s of CPU
+# on a typical machine, mostly from protected system processes), so while the
+# window is closed it only runs on push cycles, when the result is actually needed
+_TOP_SCAN_INTERVAL = 10
+_TOP_SCAN_EVERY = max(1, round(_TOP_SCAN_INTERVAL / _COLLECT_INTERVAL))
+
 # Maximum number of readings kept in memory for the UI to display
 _HISTORY  = 100
 
@@ -52,6 +59,15 @@ class SystemMonitor:
         # Event flag — calling stop() sets this, which wakes the sleeping thread early
         # and causes _run() to exit cleanly instead of waiting for the full 60s interval
         self._stop    = threading.Event()
+
+        # Set while the System Stats window is open — the UI flips it via
+        # set_live_view(), and the background thread checks it to decide how often
+        # to run the expensive top-process scan. An Event is a thread-safe flag.
+        self._live_view = threading.Event()
+
+        # Last top-process results, reused on collections that skip the scan.
+        # Only the background thread touches this, so it needs no lock.
+        self._last_top = ("--", "--", "--")
 
         # Rolling buffer of the last 100 *pushed* readings (one per _PUSH_INTERVAL),
         # matching what's in DynamoDB; oldest entry is dropped automatically
@@ -93,6 +109,17 @@ class SystemMonitor:
     def join(self, timeout=None):
         """Wait up to `timeout` seconds for the background thread to finish."""
         self._thread.join(timeout)
+
+    def set_live_view(self, active):
+        """Tell the monitor whether someone is watching the live stats.
+
+        While active, top processes are refreshed every _TOP_SCAN_INTERVAL seconds;
+        otherwise only once per push, which cuts the app's idle CPU use sharply.
+        """
+        if active:
+            self._live_view.set()
+        else:
+            self._live_view.clear()
 
     def get_latest(self):
         """Return the most recent reading as a dict, or None if no data yet."""
@@ -156,8 +183,8 @@ class SystemMonitor:
     def _run(self):
         """Entry point for the background thread. Runs until stop() is called."""
         # Prime cpu_percent — its first non-blocking call always returns 0.0.
-        # The process scan in _collect() runs before the CPU read, so even the first
-        # reading covers a window of a couple of seconds.
+        # The first collection always pushes, so its process scan runs before the
+        # CPU read and even the first reading covers a window of a couple of seconds.
         psutil.cpu_percent(interval=None)
         self._init_aws_clients()
 
@@ -167,13 +194,17 @@ class SystemMonitor:
             # Catch-all so one bad cycle is logged and skipped — an uncaught
             # exception here would kill the thread and silently freeze the stats
             try:
-                record = self._collect()
+                push = tick % _PUSH_EVERY == 0
+                # Pushes always get fresh top processes; otherwise only scan when
+                # someone has the stats window open to see the result
+                scan_top = push or (self._live_view.is_set() and tick % _TOP_SCAN_EVERY == 0)
+                record = self._collect(scan_top)
 
                 # Update under the lock so the UI thread sees a consistent state
                 with self._lock:
                     self._latest = record
 
-                if tick % _PUSH_EVERY == 0:
+                if push:
                     with self._lock:
                         self._history.append(record)
                     self._push_cloudwatch(record)
@@ -244,9 +275,15 @@ class SystemMonitor:
                 self._history.extend(records)
         except Exception as exc:
             _log.error("DynamoDB history load failed: %s", exc)
-    def _collect(self):
-        """Read current system stats from psutil and return as a plain dict."""
-        top_cpu, top_ram, top_disk = self._top_processes()
+    def _collect(self, scan_top=True):
+        """Read current system stats from psutil and return as a plain dict.
+
+        The system-wide numbers are cheap and always fresh. The top processes are
+        only rescanned when scan_top is True; otherwise the last results are reused.
+        """
+        if scan_top:
+            self._last_top = self._top_processes()
+        top_cpu, top_ram, top_disk = self._last_top
         return {
             "hostname":       self._hostname,
             "timestamp":      datetime.now(timezone.utc).isoformat(),
@@ -282,8 +319,9 @@ class SystemMonitor:
         Two important psutil behaviours to know:
         - cpu_percent(interval=None) returns CPU usage since the LAST call for
           that process. The very first call always returns 0.0, so the first
-          collection cycle will show 0% for all processes. After that it works
-          correctly, measuring usage over each _COLLECT_INTERVAL window.
+          scan will show 0% for all processes. After that it works correctly,
+          measuring average usage since the previous scan (10s while the stats
+          window is open, up to 60s while it's closed).
         - io_counters() counts cumulative bytes read+written since boot, not a
           rate. So 'top disk' means the process that has done the most total
           disk work since the machine started, not necessarily right now.
